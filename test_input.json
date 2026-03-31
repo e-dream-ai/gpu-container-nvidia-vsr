@@ -1,0 +1,35 @@
+{
+  "input": {
+    "workflow": {
+      "1": {
+        "inputs": {
+          "image": "input.png",
+          "upload": "image"
+        },
+        "class_type": "LoadImage"
+      },
+      "2": {
+        "inputs": {
+          "images": ["1", 0],
+          "scale_mode": "scale by multiplier",
+          "scale_multiplier": 2,
+          "quality": "ULTRA"
+        },
+        "class_type": "RTXVideoSuperResolution"
+      },
+      "3": {
+        "inputs": {
+          "filename_prefix": "upscaled",
+          "images": ["2", 0]
+        },
+        "class_type": "SaveImage"
+      }
+    },
+    "images": [
+      {
+        "name": "input.png",
+        "image": "BASE64_ENCODED_IMAGE_HERE"
+      }
+    ]
+  }
+}

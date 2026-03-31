@@ -1,0 +1,43 @@
+{
+  "input": {
+    "workflow": {
+      "1": {
+        "inputs": {
+          "video": "input.mp4",
+          "upload": "input"
+        },
+        "class_type": "LoadVideo"
+      },
+      "2": {
+        "inputs": {
+          "video": ["1", 0]
+        },
+        "class_type": "GetVideoComponents"
+      },
+      "3": {
+        "inputs": {
+          "images": ["2", 0],
+          "scale_mode": "scale by multiplier",
+          "scale_multiplier": 2,
+          "quality": "ULTRA"
+        },
+        "class_type": "RTXVideoSuperResolution"
+      },
+      "4": {
+        "inputs": {
+          "frame_rate": ["2", 2],
+          "images": ["3", 0],
+          "audio": ["2", 1]
+        },
+        "class_type": "CreateVideo"
+      },
+      "5": {
+        "inputs": {
+          "filename_prefix": "upscaled",
+          "videos": ["4", 0]
+        },
+        "class_type": "SaveVideo"
+      }
+    }
+  }
+}

@@ -63,7 +63,7 @@ ADD src/extra_model_paths.yaml ./
 WORKDIR /
 
 # Add scripts
-ADD src/start.sh src/restore_snapshot.sh src/rp_handler.py test_input.json ./
+ADD src/start.sh src/restore_snapshot.sh src/rp_handler.py test_input.json test_input_video.json ./
 RUN chmod +x /start.sh /restore_snapshot.sh
 
 # Optionally copy snapshot file

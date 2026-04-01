@@ -1,17 +1,17 @@
-import runpod
-import json
-import urllib.request
-import time
 import os
-import requests
 import base64
-import boto3
-from botocore.exceptions import ClientError
-from io import BytesIO
-import websocket
+import json
+import time
+import urllib.request
 import uuid
+from io import BytesIO
 
-# Configuration
+import boto3
+import requests
+import runpod
+import websocket
+from botocore.exceptions import ClientError
+
 COMFY_API_AVAILABLE_INTERVAL_MS = 50
 COMFY_API_AVAILABLE_MAX_RETRIES = 500
 COMFY_POLLING_INTERVAL_MS = int(os.environ.get("COMFY_POLLING_INTERVAL_MS", 250))
@@ -21,7 +21,8 @@ COMFY_HOST = "127.0.0.1:8188"
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 
 
-def validate_input(job_input):
+def validate_input(job_input: object) -> tuple[dict | None, str | None]:
+    """Validate and normalize the RunPod job input."""
     if job_input is None:
         return None, "Please provide input"
 
@@ -31,29 +32,44 @@ def validate_input(job_input):
         except json.JSONDecodeError:
             return None, "Invalid JSON format in input"
 
+    if not isinstance(job_input, dict):
+        return None, "Input must be a JSON object"
+
     workflow = job_input.get("workflow")
     if workflow is None:
         return None, "Missing 'workflow' parameter"
 
     images = job_input.get("images")
     if images is not None:
-        if not isinstance(images, list) or not all(
-            "name" in image and "image" in image for image in images
-        ):
-            return (
-                None,
-                "'images' must be a list of objects with 'name' and 'image' keys",
-            )
+        if not isinstance(images, list):
+            return None, "'images' must be a list of objects"
+
+        normalized_images: list[dict[str, str]] = []
+        for image in images:
+            if not isinstance(image, dict):
+                return None, "'images' must contain JSON objects"
+
+            name = image.get("name")
+            image_data = image.get("image")
+            if not isinstance(name, str) or not isinstance(image_data, str):
+                return (
+                    None,
+                    "'images' entries must include string 'name' and 'image' values",
+                )
+
+            normalized_images.append({"name": name, "image": image_data})
+        images = normalized_images
 
     return {"workflow": workflow, "images": images}, None
 
 
-def check_server(url, retries=500, delay=50):
-    for i in range(retries):
+def check_server(url: str, retries: int = 500, delay: int = 50) -> bool:
+    """Wait for the ComfyUI API to become reachable."""
+    for _ in range(retries):
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=5)
             if response.status_code == 200:
-                print(f"runpod-worker-comfy - API is reachable")
+                print("runpod-worker-comfy - API is reachable")
                 return True
         except requests.RequestException:
             pass
@@ -63,26 +79,41 @@ def check_server(url, retries=500, delay=50):
     return False
 
 
-def upload_images(images):
+def upload_images(images: list[dict[str, str]] | None) -> dict:
+    """Upload optional input images to ComfyUI."""
     if not images:
         return {"status": "success", "message": "No images to upload", "details": []}
 
     responses = []
     upload_errors = []
 
-    print(f"runpod-worker-comfy - image(s) upload")
+    print("runpod-worker-comfy - image(s) upload")
 
     for image in images:
         name = image["name"]
         image_data = image["image"]
-        blob = base64.b64decode(image_data)
+
+        try:
+            blob = base64.b64decode(image_data, validate=True)
+        except ValueError:
+            return (
+                {
+                    "status": "error",
+                    "message": f"Invalid base64 image payload for {name}",
+                    "details": [name],
+                }
+            )
 
         files = {
             "image": (name, BytesIO(blob), "image/png"),
             "overwrite": (None, "true"),
         }
 
-        response = requests.post(f"http://{COMFY_HOST}/upload/image", files=files)
+        response = requests.post(
+            f"http://{COMFY_HOST}/upload/image",
+            files=files,
+            timeout=30,
+        )
         if response.status_code != 200:
             upload_errors.append(f"Error uploading {name}: {response.text}")
         else:
@@ -104,23 +135,26 @@ def upload_images(images):
     }
 
 
-def queue_workflow(workflow):
-    data = json.dumps({"prompt": workflow}).encode("utf-8")
+def queue_workflow(workflow: dict, client_id: str) -> dict:
+    """Queue a ComfyUI workflow and bind it to the websocket client."""
+    data = json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8")
     req = urllib.request.Request(f"http://{COMFY_HOST}/prompt", data=data)
     return json.loads(urllib.request.urlopen(req).read())
 
 
-def get_history(prompt_id):
+def get_history(prompt_id: str) -> dict:
+    """Fetch workflow execution history from ComfyUI."""
     try:
         with urllib.request.urlopen(
             f"http://{COMFY_HOST}/history/{prompt_id}", timeout=5
         ) as response:
             return json.loads(response.read())
-    except:
+    except (OSError, TimeoutError, json.JSONDecodeError):
         return {}
 
 
 def upload_to_r2(job_id: str, image_path: str) -> dict:
+    """Upload a generated artifact to Cloudflare R2."""
     try:
         endpoint_url = os.environ.get("R2_ENDPOINT_URL")
         access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
@@ -133,7 +167,7 @@ def upload_to_r2(job_id: str, image_path: str) -> dict:
         public_url_base = os.environ.get("R2_PUBLIC_URL_BASE")
 
         if not all([endpoint_url, access_key_id, secret_access_key, bucket_name]):
-            raise Exception("Missing R2 configuration")
+            raise ValueError("Missing R2 configuration")
 
         s3_client = boto3.client(
             "s3",
@@ -189,41 +223,45 @@ def upload_to_r2(job_id: str, image_path: str) -> dict:
                 fallback_url = f"https://{account_id}.r2.dev/{s3_key}"
             return {"url": fallback_url, "s3_key": s3_key, "bucket": bucket_name}
 
-    except ClientError as e:
-        raise Exception(f"Failed to upload to R2: {str(e)}")
-    except Exception as e:
-        raise Exception(f"R2 upload error: {str(e)}")
+    except ClientError as error:
+        raise RuntimeError(f"Failed to upload to R2: {error}") from error
+    except Exception as error:
+        raise RuntimeError(f"R2 upload error: {error}") from error
 
 
-def base64_encode(img_path):
+def base64_encode(img_path: str) -> str:
+    """Return the generated artifact encoded as a base64 string."""
     with open(img_path, "rb") as image_file:
         encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-        return f"{encoded_string}"
+        return encoded_string
 
 
-def get_output_image_path(outputs):
-    output_images = {}
+def get_output_image_path(outputs: dict) -> str | None:
+    """Return the last generated image path or first generated video path."""
+    output_image_path = None
 
-    for node_id, node_output in outputs.items():
+    for _, node_output in outputs.items():
         if "gifs" in node_output:
             for video in node_output["gifs"]:
-                output_images = os.path.join(video["subfolder"], video["filename"])
-                return output_images
+                return os.path.join(video["subfolder"], video["filename"])
         if "images" in node_output:
             for image in node_output["images"]:
-                output_images = os.path.join(image["subfolder"], image["filename"])
+                output_image_path = os.path.join(image["subfolder"], image["filename"])
 
-    return output_images
+    return output_image_path
 
 
-def process_output_images(outputs, job_id):
-    COMFY_OUTPUT_PATH = os.environ.get("COMFY_OUTPUT_PATH", "/comfyui/output")
+def process_output_images(outputs: dict, job_id: str) -> dict:
+    """Resolve, encode, or upload the generated artifact."""
+    comfy_output_path = os.environ.get("COMFY_OUTPUT_PATH", "/comfyui/output")
 
-    output_images = get_output_image_path(outputs)
+    output_image_path = get_output_image_path(outputs)
+    if not output_image_path:
+        return {"status": "error", "message": "No generated files found in outputs"}
 
-    print(f"runpod-worker-comfy - image generation is done (100%)")
+    print("runpod-worker-comfy - image generation is done (100%)")
 
-    local_image_path = f"{COMFY_OUTPUT_PATH}/{output_images}"
+    local_image_path = os.path.join(comfy_output_path, output_image_path)
 
     print(f"runpod-worker-comfy - {local_image_path}")
 
@@ -235,11 +273,11 @@ def process_output_images(outputs, job_id):
                 print(
                     "runpod-worker-comfy - the image was generated and uploaded to R2"
                 )
-            except Exception as e:
-                print(f"runpod-worker-comfy - R2 upload failed: {str(e)}")
+            except Exception as error:
+                print(f"runpod-worker-comfy - R2 upload failed: {error}")
                 return {
                     "status": "error",
-                    "message": f"Failed to upload to R2: {str(e)}",
+                    "message": f"Failed to upload to R2: {error}",
                 }
         else:
             image = base64_encode(local_image_path)
@@ -266,7 +304,8 @@ def process_output_images(outputs, job_id):
         }
 
 
-def handler(job):
+def handler(job: dict) -> dict:
+    """Run a queued RunPod job against the local ComfyUI server."""
     job_input = job["input"]
 
     validated_data, error_message = validate_input(job_input)
@@ -276,24 +315,26 @@ def handler(job):
     workflow = validated_data["workflow"]
     images = validated_data.get("images")
 
-    check_server(
-        f"http://{COMFY_HOST}",
+    server_url = f"http://{COMFY_HOST}"
+    if not check_server(
+        server_url,
         COMFY_API_AVAILABLE_MAX_RETRIES,
         COMFY_API_AVAILABLE_INTERVAL_MS,
-    )
+    ):
+        return {"error": f"ComfyUI API did not become ready at {server_url}"}
 
     upload_result = upload_images(images)
     if upload_result["status"] == "error":
         return upload_result
 
+    client_id = str(uuid.uuid4())
     try:
-        queued_workflow = queue_workflow(workflow)
+        queued_workflow = queue_workflow(workflow, client_id)
         prompt_id = queued_workflow["prompt_id"]
         print(f"runpod-worker-comfy - queued workflow with ID {prompt_id}")
-    except Exception as e:
-        return {"error": f"Error queuing workflow: {str(e)}"}
+    except Exception as error:
+        return {"error": f"Error queuing workflow: {error}"}
 
-    client_id = str(uuid.uuid4())
     ws = None
 
     try:
@@ -301,15 +342,16 @@ def handler(job):
         ws.settimeout(1)
         ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
         print(f"runpod-worker-comfy - WebSocket connected")
-    except Exception as e:
-        print(f"runpod-worker-comfy - WebSocket connection failed: {str(e)}")
+    except Exception as error:
+        print(f"runpod-worker-comfy - WebSocket connection failed: {error}")
         ws = None
 
     start_time = time.perf_counter()
     last_percent = 0
+    history_poll_retries = 0
 
     try:
-        while True:
+        while history_poll_retries < COMFY_POLLING_MAX_RETRIES:
             if ws:
                 try:
                     out = ws.recv()
@@ -322,17 +364,31 @@ def handler(job):
                             max_value = data.get("max", 100)
 
                             if max_value > 0:
-                                percent = min(99.9, round((value / max_value) * 100, 1))
+                                percent = min(
+                                    99.9, round((value / max_value) * 100, 1)
+                                )
                                 if percent != last_percent:
-                                    elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-                                    countdown_ms = int((elapsed_ms / percent) * (100 - percent)) if percent > 0 else 0
-                                    
-                                    runpod.serverless.progress_update(job, {
-                                        "progress": percent,
-                                        "countdown_ms": countdown_ms
-                                    })
-                                    
-                                    if int(percent) != int(last_percent) and int(percent) % PROGRESS_LOG_STEP == 0:
+                                    elapsed_ms = int(
+                                        (time.perf_counter() - start_time) * 1000
+                                    )
+                                    countdown_ms = (
+                                        int((elapsed_ms / percent) * (100 - percent))
+                                        if percent > 0
+                                        else 0
+                                    )
+
+                                    runpod.serverless.progress_update(
+                                        job,
+                                        {
+                                            "progress": percent,
+                                            "countdown_ms": countdown_ms,
+                                        },
+                                    )
+
+                                    if (
+                                        int(percent) != int(last_percent)
+                                        and int(percent) % PROGRESS_LOG_STEP == 0
+                                    ):
                                         print(
                                             f"runpod-worker-comfy - progress: {percent}%"
                                         )
@@ -349,6 +405,7 @@ def handler(job):
                                 )
                                 break
                 except websocket.WebSocketTimeoutException:
+                    history_poll_retries += 1
                     history = get_history(prompt_id)
                     if prompt_id in history and history[prompt_id].get("outputs"):
                         print(
@@ -356,15 +413,23 @@ def handler(job):
                         )
                         break
             else:
+                history_poll_retries += 1
                 history = get_history(prompt_id)
                 if prompt_id in history and history[prompt_id].get("outputs"):
                     print(f"runpod-worker-comfy - generation complete")
                     break
 
                 time.sleep(COMFY_POLLING_INTERVAL_MS / 1000)
+        else:
+            return {
+                "error": (
+                    "Timed out waiting for ComfyUI output after "
+                    f"{COMFY_POLLING_MAX_RETRIES} polling attempts"
+                )
+            }
 
-    except Exception as e:
-        return {"error": f"Error during execution: {str(e)}"}
+    except Exception as error:
+        return {"error": f"Error during execution: {error}"}
     finally:
         if ws:
             ws.close()
@@ -374,10 +439,13 @@ def handler(job):
         return {"error": "No outputs found in history"}
 
     print(f"runpod-worker-comfy - setting progress to 100%")
-    runpod.serverless.progress_update(job, {
-        "progress": 100.0,
-        "countdown_ms": 0
-    })
+    runpod.serverless.progress_update(
+        job,
+        {
+            "progress": 100.0,
+            "countdown_ms": 0,
+        },
+    )
 
     images_result = process_output_images(
         history[prompt_id].get("outputs"), job["id"]

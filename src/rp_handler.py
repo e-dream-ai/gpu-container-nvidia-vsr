@@ -60,7 +60,25 @@ def validate_input(job_input: object) -> tuple[dict | None, str | None]:
             normalized_images.append({"name": name, "image": image_data})
         images = normalized_images
 
-    return {"workflow": workflow, "images": images}, None
+    files = job_input.get("files")
+    if files is not None:
+        if not isinstance(files, list):
+            return None, "'files' must be a list of objects"
+
+        normalized_files: list[dict[str, str]] = []
+        for file in files:
+            if not isinstance(file, dict):
+                return None, "'files' must contain JSON objects"
+
+            name = file.get("name")
+            url = file.get("url")
+            if not isinstance(name, str) or not isinstance(url, str):
+                return None, "'files' entries must include string 'name' and 'url' values"
+
+            normalized_files.append({"name": name, "url": url})
+        files = normalized_files
+
+    return {"workflow": workflow, "images": images, "files": files}, None
 
 
 def check_server(url: str, retries: int = 500, delay: int = 50) -> bool:
@@ -133,6 +151,51 @@ def upload_images(images: list[dict[str, str]] | None) -> dict:
         "message": "All images uploaded successfully",
         "details": responses,
     }
+
+
+def download_files(files: list[dict[str, str]] | None) -> dict:
+    """Download files from URLs and upload them to ComfyUI as inputs."""
+    if not files:
+        return {"status": "success", "message": "No files to download", "details": []}
+
+    responses = []
+    errors = []
+
+    print("runpod-worker-comfy - file(s) download")
+
+    for file in files:
+        name = file["name"]
+        url = file["url"]
+
+        try:
+            response = requests.get(url, stream=True, timeout=300)
+            response.raise_for_status()
+            blob = response.content
+        except Exception as error:
+            errors.append(f"Error downloading {name}: {error}")
+            continue
+
+        files_payload = {
+            "image": (name, BytesIO(blob), "application/octet-stream"),
+            "overwrite": (None, "true"),
+        }
+
+        upload_response = requests.post(
+            f"http://{COMFY_HOST}/upload/image",
+            files=files_payload,
+            timeout=30,
+        )
+        if upload_response.status_code != 200:
+            errors.append(f"Error uploading {name}: {upload_response.text}")
+        else:
+            responses.append(f"Successfully downloaded and uploaded {name}")
+
+    if errors:
+        print("runpod-worker-comfy - file(s) download with errors")
+        return {"status": "error", "message": "Some files failed to download", "details": errors}
+
+    print("runpod-worker-comfy - file(s) download complete")
+    return {"status": "success", "message": "All files downloaded successfully", "details": responses}
 
 
 def queue_workflow(workflow: dict, client_id: str) -> dict:
@@ -314,6 +377,7 @@ def handler(job: dict) -> dict:
 
     workflow = validated_data["workflow"]
     images = validated_data.get("images")
+    files = validated_data.get("files")
 
     server_url = f"http://{COMFY_HOST}"
     if not check_server(
@@ -326,6 +390,10 @@ def handler(job: dict) -> dict:
     upload_result = upload_images(images)
     if upload_result["status"] == "error":
         return upload_result
+
+    download_result = download_files(files)
+    if download_result["status"] == "error":
+        return download_result
 
     client_id = str(uuid.uuid4())
     try:

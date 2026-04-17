@@ -27,7 +27,7 @@ except Exception:
 try:
     import nvvfx
     print(f"runpod-worker-comfy: nvvfx location: {nvvfx.__file__}")
-    with nvvfx.VideoSuperRes("HIGH") as sr:
+    with nvvfx.VideoSuperRes(nvvfx.effects.QualityLevel.HIGH) as sr:
         sr.output_width = 1920
         sr.output_height = 1080
         sr.load()

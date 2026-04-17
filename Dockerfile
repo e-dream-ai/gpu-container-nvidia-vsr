@@ -47,7 +47,8 @@ RUN pip install runpod requests websocket-client boto3
 RUN cd custom_nodes && \
     git clone https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI.git && \
     cd Nvidia_RTX_Nodes_ComfyUI && \
-    pip install -r requirements.txt 2>/dev/null || true
+    pip install -r requirements.txt 2>/dev/null || true && \
+    pip install -U --no-build-isolation nvidia-vfx --index-url https://pypi.nvidia.com
 
 # Install ComfyUI-VideoHelperSuite for video I/O (LoadVideo, SaveVideo, CreateVideo, GetVideoComponents)
 RUN cd custom_nodes && \

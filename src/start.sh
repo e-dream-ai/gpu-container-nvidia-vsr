@@ -12,19 +12,7 @@ result = subprocess.run(
     ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
     capture_output=True, text=True,
 )
-driver = result.stdout.strip()
-print(f"nvidia-vsr: NVIDIA driver version: {driver}")
-
-# nvidia-vfx requires driver >= 570.190 on Linux.
-try:
-    if tuple(int(x) for x in driver.split(".")) < (570, 190, 0):
-        print(
-            f"nvidia-vsr: WARNING - driver {driver} may be too old for nvidia-vfx "
-            "(needs 570.190+). NvVFX may fail.",
-            file=sys.stderr,
-        )
-except Exception:
-    pass
+print(f"nvidia-vsr: NVIDIA driver version: {result.stdout.strip()}")
 
 try:
     import torch
@@ -38,7 +26,13 @@ try:
     print(f"nvidia-vsr: NvVFX warmup OK (loaded={sr.is_loaded})")
 except Exception as e:
     print(f"nvidia-vsr: NvVFX warmup FAILED: {e}", file=sys.stderr)
+    sys.exit(1)
 EOF
+
+if [ $? -ne 0 ] && [ "$SKIP_VFX_PRECHECK" != "true" ]; then
+    echo "nvidia-vsr: NvVFX unavailable on this host (likely driver < 570.190); refusing job so it reschedules" >&2
+    exit 1
+fi
 
 if [ "$SERVE_API_LOCALLY" == "true" ]; then
     echo "nvidia-vsr: Starting RunPod Handler (local API)"

@@ -1,5 +1,5 @@
 services:
-  comfyui-nvidia-vsr:
+  nvidia-vsr:
     platform: linux/amd64
     build:
       context: .
@@ -14,7 +14,3 @@ services:
       - SERVE_API_LOCALLY=true
     ports:
       - "8000:8000"
-      - "8188:8188"
-    volumes:
-      - ./data/comfyui/output:/comfyui/output
-      - ./data/runpod-volume:/runpod-volume

@@ -1,5 +1,0 @@
-runpod_worker_comfy:
-  base_path: /runpod-volume
-  checkpoints: models/checkpoints/
-  vae: models/vae/
-  upscale_models: models/upscale_models/

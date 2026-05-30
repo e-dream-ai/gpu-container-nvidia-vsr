@@ -1,527 +1,317 @@
+import contextlib
 import os
-import base64
-import json
+import signal
 import time
-import urllib.request
 import uuid
-from io import BytesIO
+from collections.abc import Callable
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
 
+import av
 import boto3
 import requests
 import runpod
-import websocket
+import torch
 from botocore.exceptions import ClientError
+from nvvfx import VideoSuperRes
 
-COMFY_API_AVAILABLE_INTERVAL_MS = 50
-COMFY_API_AVAILABLE_MAX_RETRIES = 500
-COMFY_POLLING_INTERVAL_MS = int(os.environ.get("COMFY_POLLING_INTERVAL_MS", 250))
-COMFY_POLLING_MAX_RETRIES = int(os.environ.get("COMFY_POLLING_MAX_RETRIES", 500))
-PROGRESS_LOG_STEP = int(os.environ.get("PROGRESS_LOG_STEP", 10))
-COMFY_HOST = "127.0.0.1:8188"
+GPU_DEVICE = 0
+HEVC_MAX_DIMENSION = 8192
+OUTPUT_BITRATE = 16_000_000
+DEFAULT_FPS = 30
+DOWNLOAD_TIMEOUT_SECONDS = 600
+CANCEL_CHECK_INTERVAL_FRAMES = 8
+CODEC_CANDIDATES = ("hevc_nvenc", "libx265")
+WORK_DIR = Path(os.environ.get("VSR_WORK_DIR", "/tmp/vsr"))
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 
 
-def validate_input(job_input: object) -> tuple[dict | None, str | None]:
-    """Validate and normalize the RunPod job input."""
-    if job_input is None:
-        return None, "Please provide input"
+class JobCancelled(Exception):
+    """Raised when a cancellation signal interrupts frame processing."""
 
-    if isinstance(job_input, str):
+
+class CancellationToken:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def install_signal_handlers(self) -> None:
         try:
-            job_input = json.loads(job_input)
-        except json.JSONDecodeError:
-            return None, "Invalid JSON format in input"
+            signal.signal(signal.SIGINT, self._on_signal)
+            signal.signal(signal.SIGTERM, self._on_signal)
+        except ValueError:
+            print("nvidia-vsr - not on main thread, cancellation signals unavailable")
 
+    def _on_signal(self, signum: int, _frame: object) -> None:
+        print(f"nvidia-vsr - received signal {signum}, requesting cancellation")
+        self.cancelled = True
+
+    def is_set(self) -> bool:
+        return self.cancelled
+
+
+@dataclass(frozen=True)
+class JobParams:
+    video_url: str
+    scale: int
+    quality: str
+
+
+@dataclass(frozen=True)
+class UpscaleStats:
+    frames: int
+    input_resolution: tuple[int, int]
+    output_resolution: tuple[int, int]
+    encoder: str
+    elapsed_seconds: float
+
+
+def validate_input(job_input: object) -> tuple[JobParams | None, str | None]:
     if not isinstance(job_input, dict):
         return None, "Input must be a JSON object"
 
-    workflow = job_input.get("workflow")
-    if workflow is None:
-        return None, "Missing 'workflow' parameter"
+    video_url = job_input.get("video_url")
+    if not isinstance(video_url, str) or not video_url.startswith(("http://", "https://")):
+        return None, "'video_url' must be an http(s) URL"
 
-    images = job_input.get("images")
-    if images is not None:
-        if not isinstance(images, list):
-            return None, "'images' must be a list of objects"
+    scale = job_input.get("scale", 2)
+    if scale not in (1, 2, 3, 4):
+        return None, "'scale' must be one of 1, 2, 3, 4"
 
-        normalized_images: list[dict[str, str]] = []
-        for image in images:
-            if not isinstance(image, dict):
-                return None, "'images' must contain JSON objects"
+    quality = str(job_input.get("quality", "HIGH")).upper()
+    valid_qualities = set(VideoSuperRes.QualityLevel.__members__)
+    if quality not in valid_qualities:
+        return None, f"'quality' must be one of: {', '.join(sorted(valid_qualities))}"
 
-            name = image.get("name")
-            image_data = image.get("image")
-            if not isinstance(name, str) or not isinstance(image_data, str):
-                return (
-                    None,
-                    "'images' entries must include string 'name' and 'image' values",
-                )
-
-            normalized_images.append({"name": name, "image": image_data})
-        images = normalized_images
-
-    files = job_input.get("files")
-    if files is not None:
-        if not isinstance(files, list):
-            return None, "'files' must be a list of objects"
-
-        normalized_files: list[dict[str, str]] = []
-        for file in files:
-            if not isinstance(file, dict):
-                return None, "'files' must contain JSON objects"
-
-            name = file.get("name")
-            url = file.get("url")
-            if not isinstance(name, str) or not isinstance(url, str):
-                return None, "'files' entries must include string 'name' and 'url' values"
-
-            normalized_files.append({"name": name, "url": url})
-        files = normalized_files
-
-    return {"workflow": workflow, "images": images, "files": files}, None
+    return JobParams(video_url=video_url, scale=int(scale), quality=quality), None
 
 
-def check_server(url: str, retries: int = 500, delay: int = 50) -> bool:
-    """Wait for the ComfyUI API to become reachable."""
-    for _ in range(retries):
+def download_video(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        response.raise_for_status()
+        with open(destination, "wb") as file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                file.write(chunk)
+
+
+def _frame_to_gpu_tensor(frame: av.VideoFrame) -> torch.Tensor:
+    arr = frame.to_ndarray(format="rgb24")
+    tensor = torch.from_numpy(arr).to(f"cuda:{GPU_DEVICE}")
+    return (tensor.permute(2, 0, 1).float() / 255.0).contiguous()
+
+
+def _tensor_to_frame(tensor: torch.Tensor) -> av.VideoFrame:
+    frame_np = (tensor.clamp(0.0, 1.0) * 255.0).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+    return av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+
+
+def _open_output_container(
+    output_path: Path, width: int, height: int, frame_rate: Fraction
+) -> tuple[av.container.OutputContainer, av.video.stream.VideoStream, str]:
+    for name in CODEC_CANDIDATES:
+        container = av.open(str(output_path), mode="w")
         try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                print("runpod-worker-comfy - API is reachable")
-                return True
-        except requests.RequestException:
-            pass
-        time.sleep(delay / 1000)
-
-    print(f"runpod-worker-comfy - Failed to connect to server at {url}")
-    return False
-
-
-def upload_images(images: list[dict[str, str]] | None) -> dict:
-    """Upload optional input images to ComfyUI."""
-    if not images:
-        return {"status": "success", "message": "No images to upload", "details": []}
-
-    responses = []
-    upload_errors = []
-
-    print("runpod-worker-comfy - image(s) upload")
-
-    for image in images:
-        name = image["name"]
-        image_data = image["image"]
-
-        try:
-            blob = base64.b64decode(image_data, validate=True)
-        except ValueError:
-            return (
-                {
-                    "status": "error",
-                    "message": f"Invalid base64 image payload for {name}",
-                    "details": [name],
-                }
-            )
-
-        files = {
-            "image": (name, BytesIO(blob), "image/png"),
-            "overwrite": (None, "true"),
-        }
-
-        response = requests.post(
-            f"http://{COMFY_HOST}/upload/image",
-            files=files,
-            timeout=30,
-        )
-        if response.status_code != 200:
-            upload_errors.append(f"Error uploading {name}: {response.text}")
-        else:
-            responses.append(f"Successfully uploaded {name}")
-
-    if upload_errors:
-        print(f"runpod-worker-comfy - image(s) upload with errors")
-        return {
-            "status": "error",
-            "message": "Some images failed to upload",
-            "details": upload_errors,
-        }
-
-    print(f"runpod-worker-comfy - image(s) upload complete")
-    return {
-        "status": "success",
-        "message": "All images uploaded successfully",
-        "details": responses,
-    }
-
-
-def download_files(files: list[dict[str, str]] | None) -> dict:
-    """Download files from URLs and upload them to ComfyUI as inputs."""
-    if not files:
-        return {"status": "success", "message": "No files to download", "details": []}
-
-    responses = []
-    errors = []
-
-    print("runpod-worker-comfy - file(s) download")
-
-    for file in files:
-        name = file["name"]
-        url = file["url"]
-
-        try:
-            response = requests.get(url, stream=True, timeout=300)
-            response.raise_for_status()
-            blob = response.content
-        except Exception as error:
-            errors.append(f"Error downloading {name}: {error}")
-            continue
-
-        files_payload = {
-            "image": (name, BytesIO(blob), "application/octet-stream"),
-            "overwrite": (None, "true"),
-        }
-
-        upload_response = requests.post(
-            f"http://{COMFY_HOST}/upload/image",
-            files=files_payload,
-            timeout=30,
-        )
-        if upload_response.status_code != 200:
-            errors.append(f"Error uploading {name}: {upload_response.text}")
-        else:
-            responses.append(f"Successfully downloaded and uploaded {name}")
-
-    if errors:
-        print("runpod-worker-comfy - file(s) download with errors")
-        return {"status": "error", "message": "Some files failed to download", "details": errors}
-
-    print("runpod-worker-comfy - file(s) download complete")
-    return {"status": "success", "message": "All files downloaded successfully", "details": responses}
-
-
-def queue_workflow(workflow: dict, client_id: str) -> dict:
-    """Queue a ComfyUI workflow and bind it to the websocket client."""
-    data = json.dumps({"prompt": workflow, "client_id": client_id}).encode("utf-8")
-    req = urllib.request.Request(f"http://{COMFY_HOST}/prompt", data=data)
-    return json.loads(urllib.request.urlopen(req).read())
-
-
-def get_history(prompt_id: str) -> dict:
-    """Fetch workflow execution history from ComfyUI."""
-    try:
-        with urllib.request.urlopen(
-            f"http://{COMFY_HOST}/history/{prompt_id}", timeout=5
-        ) as response:
-            return json.loads(response.read())
-    except (OSError, TimeoutError, json.JSONDecodeError):
-        return {}
-
-
-def upload_to_r2(job_id: str, image_path: str) -> dict:
-    """Upload a generated artifact to Cloudflare R2."""
-    try:
-        endpoint_url = os.environ.get("R2_ENDPOINT_URL")
-        access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
-        secret_access_key = os.environ.get("R2_SECRET_ACCESS_KEY")
-        bucket_name = os.environ.get("R2_BUCKET_NAME")
-        upload_directory = (
-            os.environ.get("R2_UPLOAD_DIRECTORY", "").strip().strip("/")
-        )
-        expires_in = int(os.environ.get("R2_PRESIGNED_EXPIRY", "86400"))
-        public_url_base = os.environ.get("R2_PUBLIC_URL_BASE")
-
-        if not all([endpoint_url, access_key_id, secret_access_key, bucket_name]):
-            raise ValueError("Missing R2 configuration")
-
-        s3_client = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-            region_name="auto",
-            config=boto3.session.Config(s3={"addressing_style": "path"}),
-        )
-
-        filename = os.path.basename(image_path)
-        name, ext = os.path.splitext(filename)
-        ext_lower = ext.lower()
-        unique_filename = f"{job_id}-{name}{ext_lower}"
-        s3_key = (
-            f"{upload_directory}/{unique_filename}"
-            if upload_directory
-            else unique_filename
-        )
-
-        content_type = "application/octet-stream"
-        if ext_lower == ".png":
-            content_type = "image/png"
-        elif ext_lower in (".jpg", ".jpeg"):
-            content_type = "image/jpeg"
-        elif ext_lower == ".gif":
-            content_type = "image/gif"
-        elif ext_lower == ".mp4":
-            content_type = "video/mp4"
-
-        with open(image_path, "rb") as file:
-            s3_client.upload_fileobj(
-                file, bucket_name, s3_key, ExtraArgs={"ContentType": content_type}
-            )
-
-        try:
-            presigned_url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": bucket_name, "Key": s3_key},
-                ExpiresIn=expires_in,
-            )
-            return {
-                "url": presigned_url,
-                "s3_key": s3_key,
-                "bucket": bucket_name,
-                "expires_in": expires_in,
-            }
+            stream = container.add_stream(name, rate=frame_rate)
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
+            stream.bit_rate = OUTPUT_BITRATE
+            stream.codec_context.open()
         except Exception:
-            if public_url_base:
-                fallback_url = f"{public_url_base.rstrip('/')}/{s3_key}"
-            else:
-                account_id = endpoint_url.split("://")[1].split(".")[0]
-                fallback_url = f"https://{account_id}.r2.dev/{s3_key}"
-            return {"url": fallback_url, "s3_key": s3_key, "bucket": bucket_name}
+            container.close()
+            continue
+        return container, stream, name
 
+    raise RuntimeError(f"No usable H.265 encoder (tried {', '.join(CODEC_CANDIDATES)})")
+
+
+def upscale_video(
+    input_path: Path,
+    output_path: Path,
+    scale: int,
+    quality: str,
+    should_cancel: Callable[[], bool],
+) -> UpscaleStats:
+    torch.cuda.set_device(GPU_DEVICE)
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+
+    input_container = av.open(str(input_path))
+    input_stream = input_container.streams.video[0]
+    input_stream.thread_type = "AUTO"
+
+    input_width = input_stream.codec_context.width
+    input_height = input_stream.codec_context.height
+    output_width = input_width * scale
+    output_height = input_height * scale
+    fps = float(input_stream.average_rate) if input_stream.average_rate else DEFAULT_FPS
+
+    print(
+        f"nvidia-vsr - {input_width}x{input_height} -> {output_width}x{output_height} "
+        f"@ {fps:.2f}fps, scale={scale}x, quality={quality}"
+    )
+
+    if output_width > HEVC_MAX_DIMENSION or output_height > HEVC_MAX_DIMENSION:
+        input_container.close()
+        raise RuntimeError(
+            f"Output {output_width}x{output_height} exceeds HEVC maximum "
+            f"of {HEVC_MAX_DIMENSION}x{HEVC_MAX_DIMENSION}"
+        )
+
+    sr = VideoSuperRes(device=GPU_DEVICE, quality=VideoSuperRes.QualityLevel[quality])
+    sr.input_width = input_width
+    sr.input_height = input_height
+    sr.output_width = output_width
+    sr.output_height = output_height
+    sr.load()
+
+    frame_rate = Fraction(fps).limit_denominator(10000)
+    output_container, video_stream, encoder = _open_output_container(
+        output_path, output_width, output_height, frame_rate
+    )
+    print(f"nvidia-vsr - encoder: {encoder}")
+
+    start_time = time.perf_counter()
+    processed = 0
+    try:
+        for frame in input_container.decode(input_stream):
+            if processed % CANCEL_CHECK_INTERVAL_FRAMES == 0 and should_cancel():
+                raise JobCancelled(f"cancelled after {processed} frames")
+
+            rgb_input = _frame_to_gpu_tensor(frame)
+            output = sr.run(rgb_input, stream_ptr=stream_ptr)
+            rgb_output = torch.from_dlpack(output.image).clone()
+
+            for packet in video_stream.encode(_tensor_to_frame(rgb_output)):
+                output_container.mux(packet)
+            processed += 1
+
+        for packet in video_stream.encode(None):
+            output_container.mux(packet)
+    finally:
+        output_container.close()
+        input_container.close()
+
+    elapsed = time.perf_counter() - start_time
+    print(f"nvidia-vsr - processed {processed} frames in {elapsed:.1f}s ({processed / elapsed:.1f} fps)")
+
+    return UpscaleStats(
+        frames=processed,
+        input_resolution=(input_width, input_height),
+        output_resolution=(output_width, output_height),
+        encoder=encoder,
+        elapsed_seconds=elapsed,
+    )
+
+
+def upload_to_r2(job_id: str, file_path: Path) -> dict:
+    endpoint_url = os.environ.get("R2_ENDPOINT_URL")
+    access_key_id = os.environ.get("R2_ACCESS_KEY_ID")
+    secret_access_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+    bucket_name = os.environ.get("R2_BUCKET_NAME")
+    upload_directory = os.environ.get("R2_UPLOAD_DIRECTORY", "").strip().strip("/")
+    expires_in = int(os.environ.get("R2_PRESIGNED_EXPIRY", "86400"))
+    public_url_base = os.environ.get("R2_PUBLIC_URL_BASE")
+
+    if not all([endpoint_url, access_key_id, secret_access_key, bucket_name]):
+        raise RuntimeError("Missing R2 configuration")
+
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name="auto",
+        config=boto3.session.Config(s3={"addressing_style": "path"}),
+    )
+
+    s3_key = f"{job_id}-{file_path.name}"
+    if upload_directory:
+        s3_key = f"{upload_directory}/{s3_key}"
+
+    try:
+        with open(file_path, "rb") as file:
+            s3_client.upload_fileobj(file, bucket_name, s3_key, ExtraArgs={"ContentType": "video/mp4"})
     except ClientError as error:
         raise RuntimeError(f"Failed to upload to R2: {error}") from error
-    except Exception as error:
-        raise RuntimeError(f"R2 upload error: {error}") from error
 
-
-def base64_encode(img_path: str) -> str:
-    """Return the generated artifact encoded as a base64 string."""
-    with open(img_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-        return encoded_string
-
-
-def get_output_image_path(outputs: dict) -> str | None:
-    """Return the last generated image path or first generated video path."""
-    output_image_path = None
-
-    for _, node_output in outputs.items():
-        if "gifs" in node_output:
-            for video in node_output["gifs"]:
-                return os.path.join(video["subfolder"], video["filename"])
-        if "images" in node_output:
-            for image in node_output["images"]:
-                output_image_path = os.path.join(image["subfolder"], image["filename"])
-
-    return output_image_path
-
-
-def process_output_images(outputs: dict, job_id: str) -> dict:
-    """Resolve, encode, or upload the generated artifact."""
-    comfy_output_path = os.environ.get("COMFY_OUTPUT_PATH", "/comfyui/output")
-
-    output_image_path = get_output_image_path(outputs)
-    if not output_image_path:
-        return {"status": "error", "message": "No generated files found in outputs"}
-
-    print("runpod-worker-comfy - image generation is done (100%)")
-
-    local_image_path = os.path.join(comfy_output_path, output_image_path)
-
-    print(f"runpod-worker-comfy - {local_image_path}")
-
-    if os.path.exists(local_image_path):
-        if os.environ.get("R2_ENDPOINT_URL"):
-            try:
-                meta = upload_to_r2(job_id, local_image_path)
-                image = meta.get("url")
-                print(
-                    "runpod-worker-comfy - the image was generated and uploaded to R2"
-                )
-            except Exception as error:
-                print(f"runpod-worker-comfy - R2 upload failed: {error}")
-                return {
-                    "status": "error",
-                    "message": f"Failed to upload to R2: {error}",
-                }
+    try:
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket_name, "Key": s3_key},
+            ExpiresIn=expires_in,
+        )
+    except Exception:
+        if public_url_base:
+            url = f"{public_url_base.rstrip('/')}/{s3_key}"
         else:
-            image = base64_encode(local_image_path)
-            print(
-                "runpod-worker-comfy - the image was generated and converted to base64"
-            )
+            account_id = endpoint_url.split("://")[1].split(".")[0]
+            url = f"https://{account_id}.r2.dev/{s3_key}"
 
-        result = {"status": "success", "message": image}
-        if os.environ.get("R2_ENDPOINT_URL"):
-            result.update(
-                {
-                    "s3_key": meta.get("s3_key"),
-                    "bucket": meta.get("bucket"),
-                    "expires_in": meta.get("expires_in"),
-                }
-            )
-            result["video"] = image
-        return result
-    else:
-        print("runpod-worker-comfy - the image does not exist in the output folder")
-        return {
-            "status": "error",
-            "message": f"Image does not exist: {local_image_path}",
-        }
+    return {"url": url, "s3_key": s3_key, "bucket": bucket_name}
 
 
 def handler(job: dict) -> dict:
-    """Run a queued RunPod job against the local ComfyUI server."""
-    job_input = job["input"]
+    params, error = validate_input(job.get("input"))
+    if error:
+        return {"error": error}
 
-    validated_data, error_message = validate_input(job_input)
-    if error_message:
-        return {"error": error_message}
+    token = CancellationToken()
+    token.install_signal_handlers()
 
-    workflow = validated_data["workflow"]
-    images = validated_data.get("images")
-    files = validated_data.get("files")
-
-    server_url = f"http://{COMFY_HOST}"
-    if not check_server(
-        server_url,
-        COMFY_API_AVAILABLE_MAX_RETRIES,
-        COMFY_API_AVAILABLE_INTERVAL_MS,
-    ):
-        return {"error": f"ComfyUI API did not become ready at {server_url}"}
-
-    upload_result = upload_images(images)
-    if upload_result["status"] == "error":
-        return upload_result
-
-    download_result = download_files(files)
-    if download_result["status"] == "error":
-        return download_result
-
-    client_id = str(uuid.uuid4())
-    try:
-        queued_workflow = queue_workflow(workflow, client_id)
-        prompt_id = queued_workflow["prompt_id"]
-        print(f"runpod-worker-comfy - queued workflow with ID {prompt_id}")
-    except Exception as error:
-        return {"error": f"Error queuing workflow: {error}"}
-
-    ws = None
+    job_id = str(job.get("id", uuid.uuid4().hex))
+    work_dir = WORK_DIR / job_id
+    input_path = work_dir / "input.mp4"
+    output_path = work_dir / f"{job_id}-upscaled.mp4"
 
     try:
-        ws = websocket.WebSocket()
-        ws.settimeout(1)
-        ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
-        print(f"runpod-worker-comfy - WebSocket connected")
-    except Exception as error:
-        print(f"runpod-worker-comfy - WebSocket connection failed: {error}")
-        ws = None
-
-    start_time = time.perf_counter()
-    last_percent = 0
-    history_poll_retries = 0
+        download_video(params.video_url, input_path)
+    except requests.RequestException as error:
+        return {"error": f"Failed to download video: {error}"}
 
     try:
-        while history_poll_retries < COMFY_POLLING_MAX_RETRIES:
-            if ws:
-                try:
-                    out = ws.recv()
-                    if isinstance(out, str):
-                        message = json.loads(out)
-
-                        if message.get("type") == "progress":
-                            data = message.get("data", {})
-                            value = data.get("value", 0)
-                            max_value = data.get("max", 100)
-
-                            if max_value > 0:
-                                percent = min(
-                                    99.9, round((value / max_value) * 100, 1)
-                                )
-                                if percent != last_percent:
-                                    elapsed_ms = int(
-                                        (time.perf_counter() - start_time) * 1000
-                                    )
-                                    countdown_ms = (
-                                        int((elapsed_ms / percent) * (100 - percent))
-                                        if percent > 0
-                                        else 0
-                                    )
-
-                                    runpod.serverless.progress_update(
-                                        job,
-                                        {
-                                            "progress": percent,
-                                            "countdown_ms": countdown_ms,
-                                        },
-                                    )
-
-                                    if (
-                                        int(percent) != int(last_percent)
-                                        and int(percent) % PROGRESS_LOG_STEP == 0
-                                    ):
-                                        print(
-                                            f"runpod-worker-comfy - progress: {percent}%"
-                                        )
-                                    last_percent = percent
-
-                        elif message.get("type") == "executing":
-                            data = message.get("data", {})
-                            if (
-                                data.get("node") is None
-                                and data.get("prompt_id") == prompt_id
-                            ):
-                                print(
-                                    f"runpod-worker-comfy - execution complete"
-                                )
-                                break
-                except websocket.WebSocketTimeoutException:
-                    history_poll_retries += 1
-                    history = get_history(prompt_id)
-                    if prompt_id in history and history[prompt_id].get("outputs"):
-                        print(
-                            f"runpod-worker-comfy - execution complete via history"
-                        )
-                        break
-            else:
-                history_poll_retries += 1
-                history = get_history(prompt_id)
-                if prompt_id in history and history[prompt_id].get("outputs"):
-                    print(f"runpod-worker-comfy - generation complete")
-                    break
-
-                time.sleep(COMFY_POLLING_INTERVAL_MS / 1000)
-        else:
-            return {
-                "error": (
-                    "Timed out waiting for ComfyUI output after "
-                    f"{COMFY_POLLING_MAX_RETRIES} polling attempts"
-                )
-            }
-
+        stats = upscale_video(
+            input_path,
+            output_path,
+            scale=params.scale,
+            quality=params.quality,
+            should_cancel=token.is_set,
+        )
+    except JobCancelled as cancelled:
+        print(f"nvidia-vsr - {cancelled}")
+        _cleanup(input_path, output_path)
+        return {"status": "cancelled", "message": str(cancelled)}
     except Exception as error:
-        return {"error": f"Error during execution: {error}"}
-    finally:
-        if ws:
-            ws.close()
+        print(f"nvidia-vsr - processing failed: {error}")
+        _cleanup(input_path, output_path)
+        return {"error": f"Upscale failed: {error}"}
 
-    history = get_history(prompt_id)
-    if not (prompt_id in history and history[prompt_id].get("outputs")):
-        return {"error": "No outputs found in history"}
+    try:
+        upload = upload_to_r2(job_id, output_path)
+    except Exception as error:
+        _cleanup(input_path, output_path)
+        return {"error": str(error)}
 
-    print(f"runpod-worker-comfy - setting progress to 100%")
-    runpod.serverless.progress_update(
-        job,
-        {
-            "progress": 100.0,
-            "countdown_ms": 0,
-        },
-    )
+    _cleanup(input_path, output_path)
 
-    images_result = process_output_images(
-        history[prompt_id].get("outputs"), job["id"]
-    )
+    return {
+        "status": "success",
+        "download_url": upload["url"],
+        "video": upload["url"],
+        "s3_key": upload["s3_key"],
+        "bucket": upload["bucket"],
+        "frames": stats.frames,
+        "input_resolution": f"{stats.input_resolution[0]}x{stats.input_resolution[1]}",
+        "output_resolution": f"{stats.output_resolution[0]}x{stats.output_resolution[1]}",
+        "encoder": stats.encoder,
+        "refresh_worker": REFRESH_WORKER,
+    }
 
-    result = {**images_result, "refresh_worker": REFRESH_WORKER}
 
-    return result
+def _cleanup(*paths: Path) -> None:
+    for path in paths:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

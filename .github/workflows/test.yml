@@ -20,10 +20,11 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install lint dependencies
+        run: pip install ruff
 
-      - name: Run snapshot restoration tests
-        run: |
-          chmod +x tests/test_restore_snapshot.sh
-          ./tests/test_restore_snapshot.sh
+      - name: Lint handler
+        run: ruff check src/rp_handler.py
+
+      - name: Byte-compile handler
+        run: python -m py_compile src/rp_handler.py

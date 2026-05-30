@@ -7,6 +7,7 @@ ENV PIP_PREFER_BINARY=1
 ENV PYTHONUNBUFFERED=1
 ENV CMAKE_BUILD_PARALLEL_LEVEL=8
 ENV PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

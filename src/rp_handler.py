@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import os
 import signal
@@ -13,8 +14,10 @@ import boto3
 import requests
 import runpod
 import torch
+import torch.nn.functional as F
 from botocore.exceptions import ClientError
 from nvvfx import VideoSuperRes
+from torchvision.io import encode_jpeg
 
 GPU_DEVICE = 0
 HEVC_MAX_DIMENSION = 8192
@@ -22,6 +25,10 @@ OUTPUT_BITRATE = 16_000_000
 DEFAULT_FPS = 30
 DOWNLOAD_TIMEOUT_SECONDS = 600
 CANCEL_CHECK_INTERVAL_FRAMES = 8
+PROGRESS_INTERVAL_SECONDS = 1.0
+PREVIEW_INTERVAL_SECONDS = 2.0
+PREVIEW_MAX_SIDE = 512
+PREVIEW_JPEG_QUALITY = 85
 CODEC_CANDIDATES = ("hevc_nvenc", "libx265")
 WORK_DIR = Path(os.environ.get("VSR_WORK_DIR", "/tmp/vsr"))
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
@@ -48,6 +55,54 @@ class CancellationToken:
 
     def is_set(self) -> bool:
         return self.cancelled
+
+
+class ProgressReporter:
+    def __init__(self, job: dict) -> None:
+        self._job = job
+        self._start = 0.0
+        self._last_progress_at = 0.0
+        self._last_preview_at = 0.0
+
+    def start(self) -> None:
+        self._start = time.perf_counter()
+        self._last_progress_at = 0.0
+        self._last_preview_at = 0.0
+
+    def report(self, processed: int, total: int, frame: torch.Tensor) -> None:
+        now = time.perf_counter()
+        if now - self._last_progress_at < PROGRESS_INTERVAL_SECONDS:
+            return
+        self._last_progress_at = now
+
+        data: dict = {}
+        if total > 0 and processed > 0:
+            data["progress"] = round(min(99.9, processed / total * 100.0), 1)
+            elapsed = now - self._start
+            data["countdown_ms"] = int(elapsed / processed * (total - processed) * 1000)
+
+        if now - self._last_preview_at >= PREVIEW_INTERVAL_SECONDS:
+            preview = self._encode_preview(frame)
+            if preview:
+                data["preview_frame"] = preview
+                self._last_preview_at = now
+
+        if data:
+            runpod.serverless.progress_update(self._job, data)
+
+    def _encode_preview(self, frame: torch.Tensor) -> str | None:
+        """Downscale a (3, H, W) RGB tensor to a small base64 JPEG."""
+        try:
+            _, height, width = frame.shape
+            scale = PREVIEW_MAX_SIDE / max(height, width)
+            if scale < 1.0:
+                frame = F.interpolate(frame.unsqueeze(0), scale_factor=scale, mode="area").squeeze(0)
+            image = (frame.clamp(0.0, 1.0) * 255.0).byte().cpu()
+            jpeg = encode_jpeg(image, quality=PREVIEW_JPEG_QUALITY)
+            return base64.b64encode(jpeg.numpy().tobytes()).decode("utf-8")
+        except Exception as error:
+            print(f"nvidia-vsr - preview encode failed: {error}")
+            return None
 
 
 @dataclass(frozen=True)
@@ -126,12 +181,24 @@ def _open_output_container(
     raise RuntimeError(f"No usable H.265 encoder (tried {', '.join(CODEC_CANDIDATES)})")
 
 
+def _count_total_frames(input_stream: av.video.stream.VideoStream, container_duration: int | None, fps: float) -> int:
+    if input_stream.frames and input_stream.frames > 0:
+        return input_stream.frames
+    duration_seconds = 0.0
+    if input_stream.duration and input_stream.time_base:
+        duration_seconds = float(input_stream.duration * input_stream.time_base)
+    elif container_duration:
+        duration_seconds = container_duration / av.time_base
+    return round(duration_seconds * fps) if duration_seconds > 0 else 0
+
+
 def upscale_video(
     input_path: Path,
     output_path: Path,
     scale: int,
     quality: str,
     should_cancel: Callable[[], bool],
+    reporter: ProgressReporter | None = None,
 ) -> UpscaleStats:
     torch.cuda.set_device(GPU_DEVICE)
     stream_ptr = torch.cuda.current_stream().cuda_stream
@@ -145,6 +212,7 @@ def upscale_video(
     output_width = input_width * scale
     output_height = input_height * scale
     fps = float(input_stream.average_rate) if input_stream.average_rate else DEFAULT_FPS
+    total_frames = _count_total_frames(input_stream, input_container.duration, fps)
 
     print(
         f"nvidia-vsr - {input_width}x{input_height} -> {output_width}x{output_height} "
@@ -172,6 +240,8 @@ def upscale_video(
     print(f"nvidia-vsr - encoder: {encoder}")
 
     start_time = time.perf_counter()
+    if reporter:
+        reporter.start()
     processed = 0
     try:
         for frame in input_container.decode(input_stream):
@@ -185,6 +255,9 @@ def upscale_video(
             for packet in video_stream.encode(_tensor_to_frame(rgb_output)):
                 output_container.mux(packet)
             processed += 1
+
+            if reporter:
+                reporter.report(processed, total_frames, rgb_output)
 
         for packet in video_stream.encode(None):
             output_container.mux(packet)
@@ -276,6 +349,7 @@ def handler(job: dict) -> dict:
             scale=params.scale,
             quality=params.quality,
             should_cancel=token.is_set,
+            reporter=ProgressReporter(job),
         )
     except JobCancelled as cancelled:
         print(f"nvidia-vsr - {cancelled}")

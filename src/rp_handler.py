@@ -63,6 +63,7 @@ class ProgressReporter:
         self._start = 0.0
         self._last_progress_at = 0.0
         self._last_preview_at = 0.0
+        self._emitted = False
 
     def start(self) -> None:
         self._start = time.perf_counter()
@@ -89,6 +90,9 @@ class ProgressReporter:
 
         if data:
             runpod.serverless.progress_update(self._job, data)
+            if not self._emitted:
+                self._emitted = True
+                print(f"nvidia-vsr - progress reporting active (progress={data.get('progress')})")
 
     def _encode_preview(self, frame: torch.Tensor) -> str | None:
         """Downscale a (3, H, W) RGB tensor to a small base64 JPEG."""
